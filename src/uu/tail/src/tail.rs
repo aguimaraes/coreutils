@@ -174,7 +174,7 @@ fn tail_file(
                     && file.is_seekable(if input.is_stdin() { offset } else { 0 })
                     && (!st.is_file() || st.len() > blksize_limit)
                 {
-                    bounded_tail(&mut file, settings);
+                    bounded_tail(&mut file, settings)?;
                     reader = BufReader::new(file);
                 } else {
                     reader = BufReader::new(file);
@@ -460,7 +460,7 @@ fn backwards_thru_file(file: &mut File, num_delimiters: u64, delimiter: u8) {
 /// end of the file, and then read the file "backwards" in blocks of size
 /// `BLOCK_SIZE` until we find the location of the first line/byte. This ends up
 /// being a nice performance win for very large files.
-fn bounded_tail(file: &mut File, settings: &Settings) {
+fn bounded_tail(file: &mut File, settings: &Settings) -> UResult<()> {
     debug_assert!(!settings.presume_input_pipe);
     let mut limit = None;
 
@@ -493,7 +493,8 @@ fn bounded_tail(file: &mut File, settings: &Settings) {
         _ => {}
     }
 
-    print_target_section(file, limit);
+    print_target_section(file, limit)?;
+    Ok(())
 }
 
 fn unbounded_tail<T: Read>(reader: &mut BufReader<T>, settings: &Settings) -> UResult<()> {
@@ -526,7 +527,7 @@ fn unbounded_tail<T: Read>(reader: &mut BufReader<T>, settings: &Settings) -> UR
         FilterMode::Bytes(Signum::Negative(count)) => {
             let mut chunks = chunks::BytesChunkBuffer::new(*count);
             chunks.fill(reader)?;
-            chunks.print(&mut writer)?;
+            chunks.write(&mut writer)?;
         }
         FilterMode::Lines(Signum::MinusZero, sep) => {
             let mut chunks = chunks::LinesChunkBuffer::new(*sep, 0);
@@ -574,19 +575,29 @@ fn unbounded_tail<T: Read>(reader: &mut BufReader<T>, settings: &Settings) -> UR
     Ok(())
 }
 
-fn print_target_section<R>(file: &mut R, limit: Option<u64>)
-where
-    R: Read + ?Sized,
-{
-    // Print the target section of the file.
+// Print the target section of the file
+fn print_target_section<
+    #[cfg(any(target_os = "linux", target_os = "android"))] R: Read + rustix::fd::AsFd,
+    #[cfg(not(any(target_os = "linux", target_os = "android")))] R: Read,
+>(
+    file: &mut R,
+    limit: Option<u64>,
+) -> UResult<()> {
     let stdout = stdout();
     let mut stdout = stdout.lock();
     if let Some(limit) = limit {
         let mut reader = file.take(limit);
-        io::copy(&mut reader, &mut stdout).unwrap();
+        io::copy(&mut reader, &mut stdout)?;
     } else {
-        io::copy(file, &mut stdout).unwrap();
+        // zero-copy fast-path
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if uucore::pipes::splice_unbounded_broker(file, &mut stdout)? {
+            io::copy(file, &mut stdout)?;
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        io::copy(file, &mut stdout)?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
